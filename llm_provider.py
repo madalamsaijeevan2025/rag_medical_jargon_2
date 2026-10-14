@@ -132,13 +132,33 @@ def configure(provider: str, api_key: str | None = None, base_url: str | None = 
     return status_after
 
 
-def ollama_reachable(timeout: float = 2.0) -> bool:
-    """Cheap health probe so the UI can warn before calls start failing."""
+_probe_cache = {"ts": 0.0, "ok": False}
+_probe_lock = threading.Lock()
+
+
+def ollama_reachable(timeout: float = 1.0, ttl_seconds: float = 10.0) -> bool:
+    """Cheap health probe so the UI can warn before calls start failing.
+
+    Uses a short connect timeout and caches the result briefly: on machines
+    where a dead/firewalled local port *times out* instead of refusing (common
+    on Windows), every status call would otherwise stall for the full timeout.
+    """
+    now = time.time()
+    with _probe_lock:
+        if now - _probe_cache["ts"] < ttl_seconds:
+            return _probe_cache["ok"]
     try:
-        r = requests.get(f"{settings.ollama_host.rstrip('/')}/api/version", timeout=timeout)
-        return r.status_code == 200
+        r = requests.get(
+            f"{settings.ollama_host.rstrip('/')}/api/version",
+            timeout=(timeout, timeout),  # short connect timeout, not just read
+        )
+        ok = r.status_code == 200
     except Exception:
-        return False
+        ok = False
+    with _probe_lock:
+        _probe_cache["ts"] = time.time()
+        _probe_cache["ok"] = ok
+    return ok
 
 
 # --- OpenAI-compatible adapters (Ollama-style I/O) ---

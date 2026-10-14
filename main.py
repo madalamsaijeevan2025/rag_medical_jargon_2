@@ -108,7 +108,15 @@ async def upload_and_convert_pdf(
         pix.save(str(image_path))
 
         try:
-            index_page(doc_id, page_num + 1, page.get_text(), str(image_path.resolve()))
+            # Run in a worker thread: the embed call can take many seconds
+            # (cloud API or VLM), and blocking the event loop here would
+            # freeze ALL other endpoints (the app's status polls timed out).
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                index_page,
+                doc_id, page_num + 1, page.get_text(), str(image_path.resolve()),
+            )
         except Exception as e:
             logger.error("indexing.failed", doc_id=doc_id, page=page_num + 1, error=str(e))
             raise HTTPException(
