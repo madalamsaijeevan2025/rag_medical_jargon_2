@@ -14,6 +14,7 @@ The key never leaves the process; it is never logged and never echoed back.
 import base64
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -221,24 +222,56 @@ def chat_api(**kwargs) -> dict:
     # Ollama messages carry raw image bytes; _to_openai_messages handles that.
     msgs = kwargs.get("messages") or []
     options = kwargs.get("options") or {}
-    payload: dict = {
-        "model": model,
-        "messages": _to_openai_messages(msgs),
-        "temperature": options.get("temperature", 0),
-    }
-    fmt = kwargs.get("format")
-    if fmt is not None:
-        # Ollama 'json' or a JSON schema -> json_object mode. With a schema we
-        # also pin the schema into the conversation so the model follows it.
-        payload["response_format"] = {"type": "json_object"}
-        schema = fmt if isinstance(fmt, dict) else None
-        if schema is not None:
-            payload["messages"] = list(payload["messages"]) + [{
-                "role": "user",
-                "content": "Return ONLY a JSON object matching exactly this JSON schema:\n"
-                           + json.dumps(schema),
-            }]
-    data = _post("/chat/completions", payload, timeout=120.0)
+
+    def _build_payload(m):
+        payload: dict = {
+            "model": m,
+            "messages": _to_openai_messages(msgs),
+            "temperature": options.get("temperature", 0),
+        }
+        fmt = kwargs.get("format")
+        if fmt is not None:
+            # Ollama 'json' or a JSON schema -> json_object mode. With a schema we
+            # also pin the schema into the conversation so the model follows it.
+            payload["response_format"] = {"type": "json_object"}
+            schema = fmt if isinstance(fmt, dict) else None
+            if schema is not None:
+                payload["messages"] = list(payload["messages"]) + [{
+                    "role": "user",
+                    "content": "Return ONLY a JSON object matching exactly this JSON schema:\n"
+                               + json.dumps(schema),
+                }]
+        return payload
+
+    # Retired chat models self-heal like the embeddings path: a 404 whose body
+    # says "use models/X" is retried with X (plus a couple of current names).
+    candidates: list[str] = [model]
+    try:
+        data = _post("/chat/completions", _build_payload(model), timeout=120.0)
+    except ProviderError as e:
+        if "HTTP 404" not in str(e):
+            raise
+        logger.warning("chat.model_fallback", tried=model, error=str(e)[:200])
+        last_error: Exception = e
+        suggested = re.search(r"use (?:the )?models/([A-Za-z0-9_.\-]+)", str(e))
+        for alt in ([suggested.group(1)] if suggested else []) + \
+                   ["gemini-3.8-flash", "gemini-2.5-flash"]:
+            if alt and alt not in candidates:
+                candidates.append(alt)
+        for alt in candidates[1:]:
+            try:
+                data = _post("/chat/completions", _build_payload(alt), timeout=120.0)
+            except ProviderError as e2:
+                if "HTTP 404" not in str(e2):
+                    raise
+                last_error = e2
+                logger.warning("chat.model_fallback", tried=alt, error=str(e2)[:200])
+                continue
+            _state["model"] = alt
+            logger.info("chat.fallback_success", model=alt)
+            break
+        else:
+            raise last_error
 
     try:
         choice = data["choices"][0]
@@ -260,22 +293,47 @@ def chat_api(**kwargs) -> dict:
 
 
 def embed_api(**kwargs) -> dict:
-    """OpenAI-compatible /embeddings. Returns ollama-shape {"embeddings": [...]}."""
+    """OpenAI-compatible /embeddings. Returns ollama-shape {"embeddings": [...]}
+
+    Google retired older embedding names (text-embedding-004 -> 404 'not
+    supported for embedContent'), so after the configured name fails with a
+    model-level 404/400 we try known-current names once and cache the winner
+    for the rest of the session.
+    """
     texts_in = kwargs.get("input") or []
-    payload = {
-        "model": _effective("embed_model", DEFAULT_EMBED_MODEL),
-        "input": texts_in,
-    }
-    data = _post("/embeddings", payload, timeout=60.0)
-    try:
-        rows = sorted(data["data"], key=lambda d: d.get("index", 0))
-        embeddings = [row["embedding"] for row in rows]
-    except (KeyError, TypeError) as e:
-        raise ProviderError(f"unexpected embeddings response shape: {e}") from e
-    if len(embeddings) != len(texts_in):
-        raise ProviderError(
-            f"embeddings count mismatch: sent {len(texts_in)}, got {len(embeddings)}")
-    return {"embeddings": embeddings}
+    configured = _state["embed_model"] or DEFAULT_EMBED_MODEL
+    candidates: list[str] = [configured]
+    for alt in ("gemini-embedding-001", "models/gemini-embedding-001",
+                "text-embedding-3-small"):
+        if alt not in candidates:
+            candidates.append(alt)
+
+    last_error: Exception | None = None
+    for model in candidates:
+        try:
+            data = _post("/embeddings", {"model": model, "input": texts_in},
+                         timeout=60.0)
+        except ProviderError as e:
+            # Only model-name errors (404/400) justify trying the next name;
+            # auth/quota/network problems must surface immediately.
+            if "HTTP 404" not in str(e) and "HTTP 400" not in str(e):
+                raise
+            last_error = e
+            logger.warning("embed.model_fallback", tried=model, error=str(e)[:160])
+            continue
+        try:
+            rows = sorted(data["data"], key=lambda d: d.get("index", 0))
+            embeddings = [row["embedding"] for row in rows]
+        except (KeyError, TypeError) as e:
+            raise ProviderError(f"unexpected embeddings response shape: {e}") from e
+        if len(embeddings) != len(texts_in):
+            raise ProviderError(
+                f"embeddings count mismatch: sent {len(texts_in)}, got {len(embeddings)}")
+        if model != configured:
+            _state["embed_model"] = model
+            logger.info("embed.fallback_success", model=model)
+        return {"embeddings": embeddings}
+    raise last_error
 
 
 # --- Unified entry points used by vlm.py / retriever.py ---

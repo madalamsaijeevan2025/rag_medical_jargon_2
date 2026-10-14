@@ -14,7 +14,7 @@ import llm_provider
 from logging_config import configure_logging
 from health import router as health_router
 from retriever import index_page, search
-from vlm import check_range, explain_detailed, extract
+from vlm import check_range, explain_detailed, extract, reset_circuit_breaker
 from dictionary_service import record_feedback, get_feedback_summary
 from document_store import document_store
 from cleanup_job import start_scheduler
@@ -284,6 +284,8 @@ async def set_llm_config(req: LLMConfigRequest):
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    # A fresh config must not inherit a stuck circuit breaker from a bad one.
+    reset_circuit_breaker()
     return {"status": "configured", **info}
 
 

@@ -143,6 +143,20 @@ def _circuit_allows() -> bool:
         return True
 
 
+def reset_circuit_breaker() -> None:
+    """Close the breaker and clear the failure count.
+
+    Called when the user re-applies an LLM config: back-to-back bad configs
+    (e.g. a retired model name) open the breaker, and it must not keep
+    rejecting calls after the config is fixed.
+    """
+    global _cb_failures, _cb_open_until
+    with _cb_lock:
+        _cb_failures = 0
+        _cb_open_until = 0
+    logger.info("circuit_breaker.reset")
+
+
 def _is_transient(exc: Exception) -> bool:
     return isinstance(exc, (ollama.ResponseError, llm_provider.ProviderError,
                             ConnectionError, TimeoutError))

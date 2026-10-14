@@ -30,10 +30,20 @@ def make_client(fake_store: dict):
     def fake_post(url, json=None, headers=None, timeout=None):
         fake_post.calls.append({"url": url, "json": json, "headers": headers})
         if "no-auth" in url:
-            return _resp(200, {"choices": [{"message": {"content": "hi"}}]}) if False else _resp(401, {"error": "x"})
+            return _resp(401, {"error": "x"})
         if url.endswith("/chat/completions"):
+            retired = fake_store.get("chat_404_model")
+            if retired and json and json.get("model") == retired:
+                return _resp(404, {"error": {"code": 404, "message":
+                    f"This model models/{retired} is no longer available. "
+                    "Please update your code to use models/fake-chat-fallback "
+                    "for the latest features and improvements."}})
             return _resp(200, fake_store.get("chat_response"))
         if url.endswith("/embeddings"):
+            retired = fake_store.get("embed_404_model")
+            if retired and json and json.get("model") == retired:
+                return _resp(404, {"error": {"code": 404, "message":
+                    f"models/{retired} is not found, or is not supported for embedContent."}})
             return _resp(200, fake_store.get("embed_response"))
         return _resp(404, {"error": "unknown endpoint"})
 
@@ -168,6 +178,71 @@ def main():
     check("embed: two texts -> two vectors", len(out) == 2 and all(len(v) == 2 for v in out))
     check("embed: vectors routed by index order", out[0] == [1.0, 2.0] and out[1] == [3.0, 4.0])
 
+    # --- 5b. Retired embedding-model name auto-fallbacks (real-world Gemini case: ---
+    # text-embedding-004 -> 404 -> tries gemini-embedding-001 -> success + cached) ---
+    fake_store["embed_404_model"] = "text-embedding-004"
+    calls_before_5b = len(fake_post.calls)
+    saved_embed_name = lp._state["embed_model"]
+    lp._state["embed_model"] = "text-embedding-004"
+    fake_store["embed_response"] = {"data": [{"index": 0, "embedding": [9.0, 8.0]}]}
+    # Disk cache persists between runs; _embed_with_retry caches under the
+    # RAW text (no kind prefix). Clear entries under old model names so this
+    # run short-circuits-proof exercises the fallback, not the cache.
+    for m in ("text-embedding-004", "gemini-embedding-001", "test-embed-model"):
+        retriever.embedding_cache._backend.delete(
+            retriever.embedding_cache.key(m, "probe q"))
+    out = retriever._embed_with_retry(["probe q"], "search_query")
+    check("embed: retired 404 model falls back", out == [[9.0, 8.0]])
+    tried = [c["json"]["model"] for c in fake_post.calls[calls_before_5b:]
+             if c["url"].endswith("/embeddings")]
+    check("embed: fallback tried current name",
+          tried == ["text-embedding-004", "gemini-embedding-001"])
+    check("embed: winner cached for session", lp._state["embed_model"] == "gemini-embedding-001")
+    lp._state["embed_model"] = saved_embed_name
+    fake_store["embed_404_model"] = None
+
+    # --- 5c. Non-model errors (auth/quota) must surface immediately (no fallback) ---
+    import llm_provider as _lpmod
+    orig_post2 = _lpmod.requests.post
+    auth_attempts = []
+    def auth_fail_post(url, json=None, headers=None, timeout=None):
+        if url.endswith("/embeddings"):
+            auth_attempts.append(json.get("model") if json else None)
+            return _resp(401, {"error": "bad key"})
+        return orig_post2(url, json=json, headers=headers, timeout=timeout)
+    lp._state["embed_model"] = "text-embedding-004"
+    fake_store.pop("embed_404_model", None)
+    _lpmod.requests.post = auth_fail_post
+    try:
+        lp.embed(input=["q"])
+        check("embed: auth error not retried with other names", False)
+    except (lp.ProviderError, requests.exceptions.RequestException, ConnectionError, TimeoutError):
+        # A 401 must fail after exactly ONE attempt, not burn through candidates.
+        check("embed: auth error not retried with other names", len(auth_attempts) == 1)
+    finally:
+        _lpmod.requests.post = orig_post2
+    lp._state["embed_model"] = saved_embed_name
+
+    # --- 5d. Retired CHAT model auto-fallbacks following Google's suggestion ---
+    # Real case: gemini-2.0-flash -> 404 "no longer available... use models/X"
+    fake_store["chat_404_model"] = "test-vision-model"
+    saved_chat_name = lp._state["model"]
+    lp._state["model"] = "test-vision-model"
+    fake_store["chat_response"] = fake_chat_payload(json.dumps({"ok": 1}))
+    r = lp.chat(messages=[{"role": "user", "content": "probe"}])
+    check("chat: retired model falls back to suggested name",
+          r["message"]["content"] == json.dumps({"ok": 1}))
+    chat_tried = [c["json"]["model"] for c in fake_post.calls
+                  if c["url"].endswith("/chat/completions")
+                  and c["json"].get("messages") == [{"role": "user", "content": "probe"}]]
+    check("chat: exactly [retired, suggested] tried",
+          chat_tried == ["test-vision-model", "fake-chat-fallback"]
+          or set(chat_tried) == {"test-vision-model", "fake-chat-fallback"})
+    check("chat: winner cached for session",
+          lp._state["model"] == "fake-chat-fallback")
+    lp._state["model"] = saved_chat_name
+    fake_store.pop("chat_404_model", None)
+
     # --- 6. Upstream errors surface as retryable provider errors ---
     lp.requests.post = orig_post  # file system only; keep proxy clean
     try:
@@ -187,8 +262,16 @@ def main():
     r = client.get("/llm/status")
     check("status endpoint: 200 + masked key", r.status_code == 200 and "sk-test-123" not in r.text)
     # Restore local mode via the endpoint itself, then confirm.
+    # Also verify a re-apply resets the circuit breaker (a bad retired-model
+    # config opened it before; vlm.py requests must be allowed again).
+    import time as _time
+    import vlm as _vlm
+    with _vlm._cb_lock:
+        _vlm._cb_open_until = _time.time() + 999
+        _vlm._cb_failures = 99
     r = client.post("/llm/config", json={"provider": "local"})
     check("config: back to local", r.status_code == 200 and r.json()["provider"] == "local")
+    check("config: circuit breaker reset on re-apply", _vlm._circuit_allows() is True)
     check("status: ollama flag present", "ollama_reachable" in client.get("/llm/status").json())
     requests.post = orig_post
 
