@@ -4,16 +4,82 @@ import time
 
 st.set_page_config(page_title="Document Intelligence System", layout="wide")
 st.title("Document Intelligence System")
-st.caption("Upload a PDF, then ask questions about it. Everything runs locally.")
+st.caption("Upload a PDF, then ask questions about it. Local Ollama, or a cloud API key — no Ollama needed.")
 
 UPLOAD_URL = "http://127.0.0.1:8000/upload"
 QUERY_URL = "http://127.0.0.1:8000/query"
 TERMS_URL = "http://127.0.0.1:8000/terms"
+LLM_CONFIG_URL = "http://127.0.0.1:8000/llm/config"
+LLM_STATUS_URL = "http://127.0.0.1:8000/llm/status"
+
+
+def fetch_llm_status():
+    try:
+        r = requests.get(LLM_STATUS_URL, timeout=10)
+        return r.json() if r.status_code == 200 else None
+    except requests.exceptions.ConnectionError:
+        return None
 
 with st.sidebar:
     st.header("Pipeline Settings")
     dpi_setting = st.slider("Render DPI", min_value=150, max_value=600, value=300, step=50)
     top_k = st.slider("Pages to read per question", min_value=1, max_value=3, value=2)
+
+    st.divider()
+    st.header("AI Backend")
+    backend_mode = st.radio(
+        "Choose how the VLM/answers run",
+        ["Local Ollama", "Cloud API key (no Ollama needed)"],
+        key="ai_backend_mode",
+    )
+
+    if backend_mode.startswith("Local"):
+        status = fetch_llm_status()
+        if status:
+            if status.get("provider") == "api":
+                st.info("Right now the cloud API is active. Ollama is not being used.")
+            elif not status.get("ollama_reachable"):
+                st.warning("Ollama is not reachable. Start Ollama, or switch to \"Cloud API key\" above.")
+            else:
+                st.success(f"Ollama reachable — model: {status.get('chat_model', '?')}")
+    else:
+        st.caption("Paste an API key from any OpenAI-compatible provider "
+                   "(OpenAI, OpenRouter, Groq, Gemini, ...). The backend then does "
+                   "all VLM + embedding work through that API instead of Ollama.")
+        api_key = st.text_input("API key", type="password", key="cloud_api_key")
+        base_url = st.text_input("Endpoint base URL", value="https://api.openai.com/v1",
+                                 key="cloud_base_url")
+        chat_model = st.text_input("Chat (VLM) model", value="gpt-4o-mini",
+                                   key="cloud_chat_model")
+        embed_model = st.text_input("Embedding model", value="text-embedding-3-small",
+                                    key="cloud_embed_model")
+        if st.button("Apply API key", type="primary"):
+            if not api_key.strip():
+                st.error("The API key field is empty.")
+            else:
+                try:
+                    r = requests.post(
+                        LLM_CONFIG_URL,
+                        json={
+                            "provider": "api",
+                            "api_key": api_key.strip(),
+                            "base_url": base_url.strip(),
+                            "model": chat_model.strip(),
+                            "embed_model": embed_model.strip(),
+                        },
+                        timeout=15,
+                    )
+                    if r.status_code == 200:
+                        info = r.json()
+                        st.success(f"Cloud API configured. Chat model: {info.get('chat_model')}")
+                    else:
+                        try:
+                            detail = r.json().get("detail", r.text)
+                        except Exception:
+                            detail = r.text
+                        st.error(f"Could not configure cloud API ({r.status_code}): {detail}")
+                except requests.exceptions.ConnectionError:
+                    st.error("Connection refused: start the backend with `python main.py` first.")
 
 def fetch_term_index(doc_id, max_wait=120, poll_interval=3):
     """Poll for term index until ready or timeout."""

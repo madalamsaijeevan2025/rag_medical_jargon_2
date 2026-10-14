@@ -10,6 +10,7 @@ from pydantic import BaseModel
 import structlog
 
 from config import get_settings
+import llm_provider
 from logging_config import configure_logging
 from health import router as health_router
 from retriever import index_page, search
@@ -241,6 +242,41 @@ async def submit_explanation_feedback(req: FeedbackRequest):
 async def explanation_quality_summary():
     """Aggregate explanation feedback stats (satisfaction score, flagged terms)."""
     return get_feedback_summary()
+
+
+# --- LLM provider configuration (local Ollama or cloud API key) ---
+class LLMConfigRequest(BaseModel):
+    provider: str                      # "local" (Ollama) or "api" (OpenAI-compatible)
+    api_key: str | None = None         # required (once) when switching to "api"
+    base_url: str | None = None        # e.g. https://api.openai.com/v1
+    model: str | None = None           # vision-capable chat model
+    embed_model: str | None = None     # embedding model
+
+
+@app.get("/llm/status")
+async def llm_status():
+    """Current AI backend: local Ollama or cloud API (key masked)."""
+    return llm_provider.status()
+
+
+@app.post("/llm/config")
+async def set_llm_config(req: LLMConfigRequest):
+    """Switch between local Ollama and a cloud (OpenAI-compatible) API at runtime.
+
+    Then upload/query/term-indexing all work without Ollama installed. The API
+    key is stored only in process memory and is never returned by any endpoint.
+    """
+    try:
+        info = llm_provider.configure(
+            req.provider,
+            api_key=req.api_key,
+            base_url=req.base_url,
+            model=req.model,
+            embed_model=req.embed_model,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return {"status": "configured", **info}
 
 
 # Term index endpoints

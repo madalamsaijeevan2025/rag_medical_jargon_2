@@ -7,6 +7,15 @@ class Settings(BaseSettings):
 
     # Ollama
     ollama_host: str = "http://localhost:11434"
+
+    # Cloud fallback when Ollama is not available. OpenAI-compatible endpoint;
+    # provider/api_key/api_base_url/api_model/api_embed_model can also be set
+    # at runtime via POST /llm/config (Streamlit sidebar).
+    llm_provider: str = "local"  # "local" (Ollama) or "api" (cloud, needs key)
+    api_key: str = ""
+    api_base_url: str = ""       # e.g. https://api.openai.com/v1 (default), OpenRouter, Groq
+    api_model: str = ""          # vision-capable chat model, e.g. gpt-4o-mini
+    api_embed_model: str = ""    # e.g. text-embedding-3-small
     ollama_timeout: int = 120
     ollama_max_retries: int = 3
     ollama_cb_threshold: int = 5

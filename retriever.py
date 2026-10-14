@@ -2,6 +2,7 @@ import chromadb
 import ollama
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from config import get_settings
+import llm_provider
 from cache import embedding_cache
 from document_store import document_store
 import structlog
@@ -16,18 +17,20 @@ col = client.get_or_create_collection("pages", metadata={"hnsw:space": "cosine"}
 
 def _is_transient(exc: Exception) -> bool:
     # Treat network / timeout errors as transient
-    return isinstance(exc, (ollama.ResponseError, ConnectionError, TimeoutError))
+    return isinstance(exc, (ollama.ResponseError, llm_provider.ProviderError,
+                            ConnectionError, TimeoutError))
 
 
 @retry(
     wait=wait_exponential(multiplier=2, min=2, max=30),
     stop=stop_after_attempt(settings.ollama_max_retries),
-    retry=retry_if_exception_type((ollama.ResponseError, ConnectionError, TimeoutError)),
+    retry=retry_if_exception_type((ollama.ResponseError, llm_provider.ProviderError,
+                                   ConnectionError, TimeoutError)),
     reraise=True,
 )
 def _embed_with_retry(texts, kind):
     # kind: "search_document" or "search_query"
-    model = settings.embed_model
+    model = llm_provider.embed_model()
     # Try cache for single text
     if len(texts) == 1:
         cached = embedding_cache.get(model, texts[0])
@@ -35,11 +38,15 @@ def _embed_with_retry(texts, kind):
             logger.debug("embed.cache_hit", model=model)
             return cached
 
-    r = ollama.embed(
-        model=model,
-        input=[f"{kind}: {t[:6000]}" for t in texts],
-        options={"num_ctx": 8192},
-    )
+    if llm_provider.status()["provider"] == "api":
+        # Cloud fallback: OpenAI-compatible /embeddings (no ollama options).
+        r = llm_provider.embed(model=model, input=[f"{kind}: {t[:6000]}" for t in texts])
+    else:
+        r = ollama.embed(
+            model=model,
+            input=[f"{kind}: {t[:6000]}" for t in texts],
+            options={"num_ctx": 8192},
+        )
     embeddings = r["embeddings"]
 
     if len(texts) == 1:

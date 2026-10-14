@@ -8,6 +8,7 @@ import ollama
 from PIL import Image
 from pydantic import BaseModel
 from config import get_settings
+import llm_provider
 from cache import vlm_cache, explain_cache
 from dictionary_service import lookup_terms, has_recent_negative_feedback
 import structlog
@@ -143,7 +144,8 @@ def _circuit_allows() -> bool:
 
 
 def _is_transient(exc: Exception) -> bool:
-    return isinstance(exc, (ollama.ResponseError, ConnectionError, TimeoutError))
+    return isinstance(exc, (ollama.ResponseError, llm_provider.ProviderError,
+                            ConnectionError, TimeoutError))
 
 
 class Finding(BaseModel):
@@ -181,14 +183,15 @@ def _page_hash(image_path: str) -> str:
 @retry(
     wait=wait_exponential(multiplier=2, min=2, max=30),
     stop=stop_after_attempt(settings.ollama_max_retries),
-    retry=retry_if_exception_type((ollama.ResponseError, ConnectionError, TimeoutError)),
+    retry=retry_if_exception_type((ollama.ResponseError, llm_provider.ProviderError,
+                                   ConnectionError, TimeoutError)),
     reraise=True,
 )
 def _chat_with_retry(**kwargs):
     if not _circuit_allows():
         raise RuntimeError("Circuit breaker open")
     try:
-        resp = ollama.chat(**kwargs)
+        resp = llm_provider.chat(**kwargs)
         _record_success()
         return resp
     except Exception as e:
@@ -206,6 +209,16 @@ def _get_response_text(resp) -> str:
         logger.info("vlm.using_thinking_field", thinking_len=len(thinking))
         return thinking
     return ""
+
+
+def _normalize_stats(resp: dict) -> dict:
+    """Guarantee the Ollama timing-key shape for logging, whatever provider answered."""
+    resp.setdefault("total_duration", 0)
+    resp.setdefault("load_duration", 0)
+    resp.setdefault("prompt_eval_duration", 0)
+    resp.setdefault("eval_duration", 0)
+    resp.setdefault("eval_count", 0)
+    return resp
 
 
 def extract_terms_from_image(image_path: str) -> list[dict]:
@@ -341,9 +354,11 @@ def _is_valid_term(name: str, category: str) -> bool:
 
 
 def extract(question, pages):
-    # Cache key
+    # Cache key: embed the effective chat model so local vs cloud results
+    # never collide, and switching providers is not masked by stale pages.
+    chat_model = llm_provider.chat_model()
     page_hashes = [_page_hash(p["image_path"]) for p in pages]
-    cached = vlm_cache.get(MODEL, question, page_hashes)
+    cached = vlm_cache.get(chat_model, question, page_hashes)
     if cached:
         logger.info("vlm.cache_hit", question=question[:50])
         return Extraction.model_validate(cached)
@@ -372,6 +387,7 @@ def extract(question, pages):
         keep_alive="10m",
     )
 
+    r = _normalize_stats(r)
     logger.info("vlm.timings", **{k: round(r[k] / 1e9, 1) for k in
             ("total_duration", "load_duration", "prompt_eval_duration", "eval_duration")},
         output_tokens=r["eval_count"])
@@ -388,7 +404,7 @@ def extract(question, pages):
 
     extraction = Extraction.model_validate_json(content)
     # Cache the result (as dict for JSON-serializable)
-    vlm_cache.set(MODEL, question, page_hashes, extraction.model_dump())
+    vlm_cache.set(chat_model, question, page_hashes, extraction.model_dump())
     return extraction
 
 
@@ -417,14 +433,15 @@ def check_range(value, ref):
 @retry(
     wait=wait_exponential(multiplier=2, min=2, max=30),
     stop=stop_after_attempt(settings.ollama_max_retries),
-    retry=retry_if_exception_type((ollama.ResponseError, ConnectionError, TimeoutError)),
+    retry=retry_if_exception_type((ollama.ResponseError, llm_provider.ProviderError,
+                                   ConnectionError, TimeoutError)),
     reraise=True,
 )
 def _explain_chat(names):
     if not _circuit_allows():
         raise RuntimeError("Circuit breaker open")
     try:
-        r = ollama.chat(
+        r = llm_provider.chat(
             model=MODEL,
             messages=[{"role": "user", "content": (
                 "For each medical test name, write one plain-language sentence on what it measures. "

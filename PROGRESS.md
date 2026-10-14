@@ -122,6 +122,39 @@ transparently at read time — nothing to migrate.
   `POST /feedback/explanation` 200 + request-id, `GET /explanations/quality` shows
   flagged_terms/avg_satisfaction, invalid rating → 422, `GET /health` 200. Still needs the laptop: **/upload, /query with real VLM inference, F-score measurement.**
 
+### Session 5 — 2026-10-15: Cloud-API fallback (no Ollama needed) ✅ DONE
+
+**What was asked:** when a user has no Ollama locally, give an option to paste an
+API key and have ALL VLM/AI work (page reading, extraction, explanations,
+embeddings) go through that key instead.
+
+**How it works:** any OpenAI-compatible endpoint (OpenAI `/v1`, OpenRouter, Groq,
+Gemini's OpenAI-compat surface, …). The key can be pasted in the Streamlit
+sidebar, sent to `POST /llm/config`, or seeded from `.env` (headless). Ollama
+stays the default: nothing changes for machines that have it.
+
+**What changed (6 source files + 1 new test):**
+
+| File | Change |
+|---|---|
+| `llm_provider.py` | **NEW** runtime provider module: in-memory state (provider/api_key/base_url/model/embed_model, seeded from env), `configure()`/`status()` (key never echoed), `ollama_reachable()` probe, and OpenAI-compatible adapters `chat_api()`/`embed_api()` that translate Ollama-style kwargs+responses (images → base64 data URIs; `format=` → `response_format: json_object` + schema pinned into the prompt; Ollama timing-key shape preserved). Retryable `ProviderError(ConnectionError)` for failures. |
+| `config.py` | New settings: `llm_provider` (default `local`), `api_key`, `api_base_url`, `api_model`, `api_embed_model`. |
+| `vlm.py` | Both chat call sites (`_chat_with_retry`, `_explain_chat`) now route through `llm_provider.chat()`; retry blocks also catch `ProviderError`. `extract()` cache keys use the **effective** chat model (local vs cloud results never collide; `_normalize_stats` guards timing logging). |
+| `retriever.py` | `_embed_with_retry()` routes to `llm_provider.embed()` in api mode (no ollama-only `num_ctx` option); cache keys use the effective embed model; retry catches `ProviderError`. |
+| `main.py` | New endpoints: `POST /llm/config` (switch provider at runtime; 422 on bad provider / missing key) and `GET /llm/status` (reports provider, models, base_url, `api_key_set`, `ollama_reachable` — no key material). |
+| `app.py` | Sidebar "AI Backend" choice: **Local Ollama** (shows Ollama reachability warning) or **Cloud API key** — password input for the key + endpoint/chat-model/embedding-model fields + *Apply* button that calls `/llm/config`. |
+| `test_llm_api_fallback_check.py` | **NEW** offline test (fake HTTP, no Ollama, no real API): proxy switch/apply, key masking, bearer header, no-key rejection, `extract()` end-to-end via the adapter (data-URI PNG verified, schema pinned, json response_format), `explain()` fallback, embeddings routing/order, error surfacing, and `/llm/config`+`/llm/status` through the real FastAPI app. **16/16 PASS, exit 0.** |
+
+**Regression checks after the change:** `compileall` clean; Goal #2 test 22/22 exit 0;
+Goal #6 test all-PASS exit 0; FastAPI smoke (`/health`, `/llm/*` round-trip, key never
+in response bodies, openapi contains new endpoints) exit 0 — then provider restored to
+`local` (unit tests keep `conversation state` clean). NB: `.env` key format is
+`LLM_PROVIDER=api`, `API_KEY=...` etc.; cloud defaults live in `llm_provider.py`
+(OpenAI `/v1`, `gpt-4o-mini`, `text-embedding-3-small`).
+
+**Still laptop-only:** an actual cloud call with a real key (billable) and Ollama
+side-by-side comparison.
+
 ## 4. Goal status (from FUTURE_GOALS.md)
 
 | # | Goal | Status |
