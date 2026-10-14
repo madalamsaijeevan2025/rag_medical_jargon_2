@@ -1,5 +1,6 @@
 import sqlite3
 import threading
+from datetime import datetime, timedelta
 from functools import lru_cache
 from config import get_settings
 from cache import explain_cache
@@ -31,6 +32,19 @@ def _ensure_db():
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_term_lower 
         ON medical_terms (LOWER(term))
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS explanation_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            term TEXT NOT NULL,
+            rating TEXT NOT NULL CHECK (rating IN ('good','fair','poor')),
+            comment TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_feedback_term
+        ON explanation_feedback (term)
     """)
     conn.commit()
 
@@ -118,6 +132,79 @@ def get_all_terms() -> list[dict]:
     conn = _get_conn()
     rows = conn.execute("SELECT term, category, definition, clinical_significance FROM medical_terms ORDER BY term").fetchall()
     return [dict(r) for r in rows]
+
+
+# --- Explanation feedback loop (Goal #6) ---
+FEEDBACK_DECAY_DAYS = 7
+_VALID_RATINGS = ("good", "fair", "poor")
+
+
+def record_feedback(term: str, rating: str, comment: str | None = None) -> bool:
+    """Store user feedback about an explanation.
+
+    rating must be 'good', 'fair' or 'poor'. A 'poor' rating flags the term so
+    the next explanation request forces a fresh VLM definition (re-explain).
+    """
+    if rating not in _VALID_RATINGS:
+        return False
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO explanation_feedback (term, rating, comment, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (term, rating, comment, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        logger_msg = f"feedback.record_failed: {e}"
+        print(logger_msg)  # no structlog dependency here; keep module standalone
+        return False
+
+
+def has_recent_negative_feedback(term: str) -> bool:
+    """True when the term got a 'poor' rating within FEEDBACK_DECAY_DAYS days
+    with no later 'good' rating to clear the flag."""
+    conn = _get_conn()
+    cutoff = (datetime.utcnow() - timedelta(days=FEEDBACK_DECAY_DAYS)).isoformat()
+    row = conn.execute(
+        """
+        SELECT rating, created_at FROM explanation_feedback
+        WHERE LOWER(term) = LOWER(?)
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (term,),
+    ).fetchone()
+    if row is None:
+        return False
+    return row["rating"] == "poor" and str(row["created_at"]) >= cutoff
+
+
+def get_feedback_summary() -> dict:
+    """Aggregate feedback stats: counts, satisfaction score (out of 5), flagged terms."""
+    conn = _get_conn()
+    total = conn.execute("SELECT COUNT(*) AS n FROM explanation_feedback").fetchone()["n"]
+    rows = conn.execute(
+        "SELECT rating, COUNT(*) AS n FROM explanation_feedback GROUP BY rating"
+    ).fetchall()
+    counts = {r["rating"]: r["n"] for r in rows}
+
+    flagged_rows = conn.execute(
+        "SELECT DISTINCT term FROM explanation_feedback WHERE rating = 'poor'"
+    ).fetchall()
+    flagged = sorted(r["term"] for r in flagged_rows)
+
+    score_map = {"good": 5, "fair": 3, "poor": 1}
+    total_score = sum(score_map.get(rating, 0) * n for rating, n in counts.items())
+    avg = round(total_score / total, 2) if total else None
+
+    return {
+        "total_feedback": total,
+        "ratings": counts,
+        "avg_satisfaction_out_of_5": avg,
+        "flagged_terms": flagged,
+    }
 
 
 if __name__ == "__main__":

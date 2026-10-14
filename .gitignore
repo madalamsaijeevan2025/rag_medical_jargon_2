@@ -9,3 +9,6 @@ extracted_pages/
 term_indexes/
 scripts/
 analysis_results/
+
+# this project
+Vision-RAG-Document-Analyzer.pdf

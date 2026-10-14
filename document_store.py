@@ -45,8 +45,16 @@ class DocumentStore:
         if doc_id not in self._meta:
             self._meta[doc_id] = DocumentMeta(doc_id=doc_id, page_count=0, created_at=now, size_bytes=0)
         meta = self._meta[doc_id]
-        meta.page_count += 1
-        meta.size_bytes += img_size
+        if page_no == 1:
+            # A fresh (or re-)upload starts at page 1: reset accumulated size and
+            # refresh created_at so the cleanup TTL tracks the newest upload.
+            meta.size_bytes = img_size
+            meta.created_at = now
+        else:
+            meta.size_bytes += img_size
+        # Count distinct pages instead of +1 per call, so re-uploading the same
+        # PDF cannot inflate page_count.
+        meta.page_count = max(meta.page_count, page_no)
         self._save_index()
 
     def list_docs(self) -> List[DocumentMeta]:

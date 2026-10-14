@@ -9,13 +9,110 @@ from PIL import Image
 from pydantic import BaseModel
 from config import get_settings
 from cache import vlm_cache, explain_cache
-from dictionary_service import lookup_terms
+from dictionary_service import lookup_terms, has_recent_negative_feedback
 import structlog
 
 logger = structlog.get_logger()
 
 settings = get_settings()
 MODEL = settings.vlm_model
+
+# --- Explanation quality scoring (Goal #6) ---
+# Text fragments that mark a definition as a failure/placeholder instead of a real
+# explanation. Any definition containing one of these scores 0.
+LOW_QUALITY_MARKERS = (
+    "not found",
+    "unknown",
+    "no definition",
+    "n/a",
+    "this is not on",
+    "i don't know",
+    "cannot determine",
+    "unable to",
+)
+# Definitions scoring below this are considered stale and get regenerated.
+GOOD_QUALITY_THRESHOLD = 0.5
+
+
+def score_definition(definition: str | None) -> float:
+    """Heuristic quality score in [0.0, 1.0] for one explanation sentence.
+
+    Pure and dependency-free so it can be unit tested without Ollama.
+    """
+    if not definition:
+        return 0.0
+    text = str(definition).strip()
+    if not text:
+        return 0.0
+
+    low = text.lower()
+    if any(marker in low for marker in LOW_QUALITY_MARKERS):
+        return 0.0
+
+    # Length heuristics: too short to be informative, too long to be a sentence.
+    if len(text) < 15:
+        return 0.2
+    if len(text) > 400:
+        return 0.6
+
+    score = 0.6 if len(text) >= 40 else 0.5
+
+    # A real explanation usually ends with terminal punctuation.
+    if text[-1] in ".!?":
+        score += 0.1
+
+    # Avoid ALL-CAPS style output (usually labels, not explanations).
+    letters = [c for c in text if c.isalpha()]
+    if letters:
+        upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+        if upper_ratio > 0.7:
+            return 0.3
+
+    return min(score, 1.0)
+
+
+# --- Extraction prompting guidance (Goal #2) ---
+# Common section headers in medical reports; terms under these are high-priority.
+SECTION_HINTS = (
+    "Laboratory Results", "Results", "Complete Blood Count", "Differential",
+    "Comprehensive Metabolic Panel", "Basic Metabolic Panel", "Lipid Panel",
+    "Liver Function Tests", "Thyroid Panel", "Urinalysis", "Microbiology",
+    "Chemistry", "Hematology", "Coagulation",
+    "Vital Signs", "Physical Exam", "History of Present Illness",
+    "Impressions", "Findings", "Conclusions", "Diagnosis", "Assessment",
+    "Recommendations", "Technique", "Comparison", "Clinical History",
+    "Pathology Report", "Biopsy Report", "Medications",
+)
+
+# Very common terms extracted from lab reports; anchors so the VLM does not miss them.
+LAB_TERM_HINTS = (
+    "Hemoglobin", "Hematocrit", "WBC", "RBC", "Platelets", "MCV",
+    "Glucose", "HbA1c", "Creatinine", "eGFR", "BUN", "Urea",
+    "Sodium", "Potassium", "Chloride", "Calcium", "Bicarbonate",
+    "ALT", "AST", "ALP", "Bilirubin", "Albumin", "Total Protein",
+    "Cholesterol", "Triglycerides", "LDL", "HDL",
+    "TSH", "T4", "Ferritin", "Iron", "CRP", "ESR", "Troponin",
+    "PT/INR", "aPTT", "Vitamin D", "Vitamin B12", "Folate",
+)
+
+# Shared layout/noise guidance appended to every extraction prompt.
+PAGE_LAYOUT_GUIDANCE = (
+    "PAGE READING GUIDANCE:\n"
+    "- Reports are often tables or multi-column layouts. Read table rows cell by cell: "
+    "each row usually pairs one test name with its value, unit, and a reference-range "
+    "column. Never mix the value column with the reference-range column.\n"
+    "- On two-column or boxed pages, finish the left box/column top-to-bottom before "
+    "the right one; report terms from every section, not just the first.\n"
+    "- Section headers (e.g. Laboratory Results, Complete Blood Count, Impressions, "
+    "Findings, Diagnosis) separate content; use the section a term appears under "
+    "when choosing its category.\n"
+    "IGNORE as noise (never list these as terms): patient name/ID/age/sex, dates and "
+    "times, accession/case/visit numbers, hospital and doctor names, signatures, "
+    "addresses and phone numbers, billing/insurance codes, page numbers, letterheads, "
+    "disclaimers and footer text, and standalone values, units, or dates with no "
+    "test name attached."
+)
+
 
 # Simple circuit breaker
 _cb_failures = 0
@@ -113,20 +210,13 @@ def _get_response_text(resp) -> str:
 
 def extract_terms_from_image(image_path: str) -> list[dict]:
     """Extract medical term names and categories from a single image."""
-    from PIL import Image
-    import io
-    
-    def _shrink_local(path, max_side=1400):
-        img = Image.open(path).convert("RGB")
-        img.thumbnail((max_side, max_side))
-        buf = io.BytesIO()
-        img.save(buf, "PNG")
-        return buf.getvalue()
-    
     prompt = (
         "Extract ALL medical terms, lab test names, abbreviations, and clinical findings visible on this page. "
         "List each term with its category. "
         "Categories: 'Lab Marker', 'Radiology', 'Condition', 'Anatomy/Procedure', 'Other'. "
+        "Prioritize terms under section headers such as: "
+        + ", ".join(SECTION_HINTS[:8]) + ".\n"
+        + PAGE_LAYOUT_GUIDANCE + "\n"
         "Only include terms that are medical/clinical. No values, just names and category. "
         "Format each line as: TERM_NAME | CATEGORY"
     )
@@ -134,7 +224,7 @@ def extract_terms_from_image(image_path: str) -> list[dict]:
     msgs = [{
         "role": "user",
         "content": prompt,
-        "images": [_shrink_local(image_path)],
+        "images": [_shrink(image_path)],
     }]
     
     try:
@@ -219,20 +309,32 @@ def _is_valid_term(name: str, category: str) -> bool:
     if len(category) < 2 or len(category) > 40:
         return False
     
-    # Valid categories
-    valid_cats = {'lab marker', 'radiology', 'condition', 'anatomy/procedure', 'other', 
-                  'clinical finding', 'abbreviation', 'drug', 'gene', 'procedure'}
+    # Valid categories (case-insensitive)
+    valid_cats = {'lab marker', 'lab', 'laboratory', 'radiology', 'condition',
+                  'anatomy/procedure', 'other', 'clinical finding', 'finding',
+                  'abbreviation', 'drug', 'medication', 'gene', 'procedure',
+                  'pathology', 'diagnosis', 'microbiology', 'chemistry',
+                  'hematology', 'symptom'}
     if category.lower() not in valid_cats:
         return False
     
-    # Skip common reasoning prefixes
-    skip_prefixes = ['background', 'case presentation', 'introduction', 'abstract', 
-                     'from the', 'also', 'wait', 'let', 'so ', 'note:', 'see']
+    # Skip reasoning text and document-noise prefixes
+    skip_prefixes = ['background', 'case presentation', 'introduction', 'abstract',
+                     'from the', 'also', 'wait', 'let', 'so ', 'note:', 'see',
+                     'patient', 'date', 'time', 'age', 'sex', 'gender', 'name',
+                     'accession', 'collected', 'received', 'reported', 'specimen',
+                     'signature', 'physician', 'doctor', 'dr ', 'hospital',
+                     'department', 'billing', 'insurance', 'address', 'phone',
+                     'page', 'print']
     if any(name.lower().startswith(p) for p in skip_prefixes):
         return False
     
     # Skip if name looks like a sentence (too many words, ends with period)
     if name.count(' ') > 6 or name.endswith('.'):
+        return False
+    
+    # Skip a bare value, unit, or date with no test name attached
+    if re.fullmatch(r"[0-9.,%/()<>=~≤≥\s\-–]+", name):
         return False
     
     return True
@@ -256,7 +358,8 @@ def extract(question, pages):
             "'This is not on the pages I read.' Do not give medical advice or diagnoses.\n"
             "Then list any specific test values you used in 'findings'. "
             "Copy the reference range printed next to each value into reference_range, "
-            "exactly as written. Leave it empty if none is printed."
+            "exactly as written. Leave it empty if none is printed.\n"
+            + PAGE_LAYOUT_GUIDANCE
         ),
         "images": [_shrink(p["image_path"]) for p in pages],
     }]
@@ -339,42 +442,95 @@ def _explain_chat(names):
         raise
 
 
-def explain(findings):
+def explain_detailed(findings):
+    """Build plain-language explanations with source tracking and quality scores.
+
+    Hybrid pipeline: cache -> local SQLite dictionary -> VLM. Terms that the user
+    rated 'poor' (or that cached low-quality output) are force-reexplained instead
+    of trusting the dictionary/cache (feedback loop, Goal #6).
+
+    Returns a dict with three parallel maps:
+        sentences: {term: definition text}
+        sources:   {term: 'local_db' | 'vlm' | 'cache'}
+        qualities: {term: float 0.0-1.0 heuristic quality score}
+    """
     names = list({f.name for f in findings})[:15]
+    empty = {"sentences": {}, "sources": {}, "qualities": {}}
     if not names:
-        return {}
+        return empty
 
-    # 1. Check explain cache first (full result)
-    cached = explain_cache.get(names)
-    if cached:
-        logger.info("explain.cache_hit", names=names)
-        return cached
+    # 1. Read cache. Entries may be legacy plain strings or new meta dicts.
+    cached = explain_cache.get(names) or {}
+    norm = {}
+    for term, val in cached.items():
+        if isinstance(val, dict):
+            norm[term] = {
+                "definition": str(val.get("definition", "")),
+                "source": val.get("source", "cache"),
+                "quality": float(val.get("quality", 0.0)),
+            }
+        else:
+            norm[term] = {
+                "definition": str(val),
+                "source": "cache",
+                "quality": score_definition(val),
+            }
 
-    # 2. Local dictionary lookup (instant)
-    dict_result = lookup_terms(names)
-    found = dict_result["found"]
-    missing = dict_result["missing"]
+    # 2. Terms the user flagged as poor, plus low-quality cache entries, get
+    #    regenerated rather than trusted.
+    flagged = {n for n in names if has_recent_negative_feedback(n)}
+    stale = {
+        n for n in names
+        if norm.get(n, {}).get("quality", 0.0) < GOOD_QUALITY_THRESHOLD
+    }
+    regen = flagged | stale
 
-    # 3. Build sentences from local DB
-    sentences = {}
-    for term, data in found.items():
-        sentences[term] = data["definition"]
+    entries = {t: m for t, m in norm.items() if t in names and t not in regen}
+    if entries:
+        logger.debug("explain.cache_entries_used", terms=list(entries.keys()))
 
-    # 4. If all found locally, cache and return
-    if not missing:
-        explain_cache.set(names, sentences)
-        logger.info("explain.dict_full_hit", names=names)
-        return sentences
+    # 3. Remaining terms: local dictionary first (skip user-flagged terms).
+    missing = [n for n in names if n not in entries]
+    dict_result = lookup_terms(missing)
+    for term, data in dict_result["found"].items():
+        if term in flagged:
+            continue  # user marked this poor; force a fresh VLM definition
+        entries[term] = {
+            "definition": data["definition"],
+            "source": "local_db",
+            "quality": score_definition(data["definition"]),
+        }
 
-    # 5. Fallback to VLM for missing terms only
-    logger.info("explain.vlm_fallback", missing=missing, found=list(found.keys()))
-    r = _explain_chat(missing)
-    try:
-        vlm_result = json.loads(r["message"]["content"])
-    except Exception:
-        vlm_result = {}
+    # 4. Fallback to VLM for anything still uncovered (missing terms + flagged).
+    remaining = [n for n in names if n not in entries]
+    if remaining:
+        logger.info("explain.vlm_fallback", missing=remaining, found=list(entries.keys()))
+        r = _explain_chat(remaining)
+        try:
+            vlm_result = json.loads(r["message"]["content"])
+        except Exception as e:
+            logger.warning("explain.vlm_parse_failed", error=str(e))
+            vlm_result = {}
+        for term in remaining:
+            sentence = str(vlm_result.get(term, "")).strip()
+            entries[term] = {
+                "definition": sentence,
+                "source": "vlm",
+                "quality": score_definition(sentence),
+            }
 
-    # 6. Merge and cache
-    sentences.update(vlm_result)
-    explain_cache.set(names, sentences)
-    return sentences
+    result = {
+        "sentences": {t: m["definition"] for t, m in entries.items()},
+        "sources": {t: m.get("source", "unknown") for t, m in entries.items()},
+        "qualities": {t: round(m.get("quality", 0.0), 2) for t, m in entries.items()},
+    }
+
+    # 5. Cache full meta entries (TTL refresh each read). Legacy explain()
+    #    cache entries are upgraded transparently via the normalization above.
+    explain_cache.set(names, entries)
+    return result
+
+
+def explain(findings):
+    """Backward-compatible wrapper: only the {term: definition text} map."""
+    return explain_detailed(findings)["sentences"]

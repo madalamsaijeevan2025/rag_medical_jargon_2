@@ -1,4 +1,5 @@
 fastapi>=0.110
+python-multipart>=0.0.9
 uvicorn>=0.29
 pymupdf>=1.23
 pydantic>=2.7

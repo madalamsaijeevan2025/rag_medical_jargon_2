@@ -13,7 +13,8 @@ from config import get_settings
 from logging_config import configure_logging
 from health import router as health_router
 from retriever import index_page, search
-from vlm import check_range, explain, extract
+from vlm import check_range, explain_detailed, extract
+from dictionary_service import record_feedback, get_feedback_summary
 from document_store import document_store
 from cleanup_job import start_scheduler
 from term_indexer import index_terms_for_document, load_term_index
@@ -71,6 +72,7 @@ app.mount("/static", StaticFiles(directory=OUTPUT_DIR), name="static")
 
 @app.post("/upload")
 async def upload_and_convert_pdf(
+    request: Request,
     file: UploadFile = File(...),
     dpi: int = Query(default=300, ge=settings.min_dpi, le=settings.max_dpi),
 ):
@@ -118,7 +120,7 @@ async def upload_and_convert_pdf(
             "filename": image_name,
             "resolution": f"{pix.width}x{pix.height}px",
             "path": str(image_path.resolve()),
-            "url": f"http://127.0.0.1:8000/static/{image_name}",
+            "url": f"{str(request.base_url)}static/{image_name}",
         })
 
     doc.close()
@@ -159,7 +161,10 @@ async def query_document(req: QueryRequest):
     try:
         result = extract(req.question, pages)
         t2 = time.time()
-        what_it_is = explain(result.findings)
+        explained = explain_detailed(result.findings)
+        what_it_is = explained["sentences"]
+        definition_sources = explained["sources"]
+        definition_qualities = explained["qualities"]
         t3 = time.time()
     except Exception as e:
         logger.error("vlm.failed", error=str(e))
@@ -170,7 +175,9 @@ async def query_document(req: QueryRequest):
     rows = [
         {**f.model_dump(),
          "status": check_range(f.value, f.reference_range),
-         "what_it_measures": what_it_is.get(f.name, "")}
+         "what_it_measures": what_it_is.get(f.name, ""),
+         "definition_source": definition_sources.get(f.name, ""),
+         "definition_quality": definition_qualities.get(f.name, 0.0)}
         for f in result.findings
     ]
     return {
@@ -207,6 +214,33 @@ async def delete_document(doc_id: str):
     
     logger.info("document.deleted", doc_id=doc_id)
     return {"status": "deleted", "doc_id": doc_id}
+
+
+# Explanation feedback endpoints (Goal #6)
+class FeedbackRequest(BaseModel):
+    term: str
+    rating: str  # one of: poor, fair, good
+    comment: str | None = None
+
+
+@app.post("/feedback/explanation")
+async def submit_explanation_feedback(req: FeedbackRequest):
+    """Record user feedback on a term explanation; 'poor' flags it for re-explanation."""
+    if req.rating not in ("poor", "fair", "good"):
+        raise HTTPException(status_code=422, detail="rating must be one of: poor, fair, good")
+    if not req.term.strip():
+        raise HTTPException(status_code=422, detail="term must not be empty")
+    success = record_feedback(req.term.strip(), req.rating, req.comment)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to record feedback")
+    logger.info("feedback.recorded", term=req.term, rating=req.rating)
+    return {"status": "recorded", "term": req.term, "rating": req.rating}
+
+
+@app.get("/explanations/quality")
+async def explanation_quality_summary():
+    """Aggregate explanation feedback stats (satisfaction score, flagged terms)."""
+    return get_feedback_summary()
 
 
 # Term index endpoints

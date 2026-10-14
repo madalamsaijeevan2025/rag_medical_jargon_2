@@ -6,7 +6,8 @@ import structlog
 
 from config import get_settings
 from retriever import search
-from vlm import extract, explain
+from vlm import (extract, explain_detailed, SECTION_HINTS, LAB_TERM_HINTS,
+                 PAGE_LAYOUT_GUIDANCE)
 from document_store import document_store
 from dictionary_service import lookup_terms
 
@@ -28,10 +29,16 @@ def _page_hash(image_path: str) -> str:
 def _build_extract_prompt(page_nums: List[int]) -> str:
     return (
         f"Pages are in order: {page_nums}.\n"
-        "Extract ALL medical terms, lab test names, abbreviations, and clinical findings visible on these pages. "
-        "For each term, include: name, value (if present), unit (if present), reference_range (if present), page number. "
-        "Return JSON matching the Extraction schema. If no terms found, return empty findings array. "
-        "Do not give medical advice or diagnoses."
+        "TASK: Extract every clinically meaningful term visible on these pages.\n"
+        "INCLUDE: lab test names, abbreviations, radiology and pathology findings, "
+        "conditions/diagnoses, procedures, anatomy terms, and medications if printed.\n"
+        f"HIGH-PRIORITY sections: {', '.join(SECTION_HINTS)}.\n"
+        f"ANCHOR TERMS (do not miss these if they are visible): {', '.join(LAB_TERM_HINTS)}.\n"
+        + PAGE_LAYOUT_GUIDANCE + "\n"
+        "For each term, include: name, value (if present), unit (if present), "
+        "reference_range (if present), page number.\n"
+        "Return JSON matching the Extraction schema. If no terms found, return empty "
+        "findings array. Do not give medical advice or diagnoses."
     )
 
 
@@ -85,9 +92,11 @@ def index_terms_for_document(doc_id: str) -> Dict[str, Any]:
     
     logger.info("term_indexer.deduped", total=len(all_findings), unique=len(unique_findings))
     
-    # Get explanations (uses hybrid dict + VLM fallback)
-    finding_names = [f.name for f in unique_findings]
-    explanations = explain(unique_findings) if finding_names else {}
+    # Get explanations (hybrid dict + VLM with source + quality tracking)
+    explained = explain_detailed(unique_findings)
+    explanations = explained["sentences"]
+    explanation_sources = explained["sources"]
+    explanation_qualities = explained["qualities"]
     
     # Build term index
     term_index = {}
@@ -95,6 +104,8 @@ def index_terms_for_document(doc_id: str) -> Dict[str, Any]:
         term_index[f.name] = {
             "name": f.name,
             "definition": explanations.get(f.name, ""),
+            "definition_source": explanation_sources.get(f.name, ""),
+            "definition_quality": explanation_qualities.get(f.name, 0.0),
             "pages": [f.page],
             "example_value": f.value if f.value else None,
             "unit": f.unit if f.unit else None,

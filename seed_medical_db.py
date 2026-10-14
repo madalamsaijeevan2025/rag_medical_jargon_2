@@ -23,6 +23,17 @@ def init_db():
         ON medical_terms (LOWER(term))
     """)
 
+    # Explanation feedback (Goal #6: user satisfaction + re-explain loop)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS explanation_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            term TEXT NOT NULL,
+            rating TEXT NOT NULL CHECK (rating IN ('good','fair','poor')),
+            comment TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+
     # Sample dataset of core medical terminologies & abbreviations
     terms_data = [
         # --- LAB MARKERS & ABBREVIATIONS ---
