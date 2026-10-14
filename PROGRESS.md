@@ -150,17 +150,47 @@ Goal #6 test all-PASS exit 0; FastAPI smoke (`/health`, `/llm/*` round-trip, key
 in response bodies, openapi contains new endpoints) exit 0 — then provider restored to
 `local` (unit tests keep `conversation state` clean). NB: `.env` key format is
 `LLM_PROVIDER=api`, `API_KEY=...` etc.; cloud defaults live in `llm_provider.py`
-(OpenAI `/v1`, `gpt-4o-mini`, `text-embedding-3-small`).
-
-**Still laptop-only:** an actual cloud call with a real key (billable) and Ollama
+(OpenAI `/v1`, `gpt-4o-mini`, `text-embedding-3-small`).**Still laptop-only:** an actual cloud call with a real key (billable) and Ollama
 side-by-side comparison.
 
-**Addendum (2026-10-15):** first real-world use surfaced the classic misconfiguration
-(a key from an unknown/unsupported provider pasted against the default OpenAI
-endpoint → upstream 401, surfaced as 503 at upload/indexing). Mitigation added:
-*app.py* now probes `{base_url}/models` with the key as soon as **Apply API key** is
-clicked, and reports "accepted" / "REJECTED (401/403), check provider-endpoint match"
-or a warning — before any upload happens. Backend config flow unchanged.
+**Addendum 1 (2026-10-15):** first real-world use surfaced the classic
+misconfiguration (a key from an unknown/unsupported provider pasted against the
+default OpenAI endpoint → upstream 401, surfaced as 503 at upload/indexing).
+Mitigation added: *app.py* now probes `{base_url}/models` with the key as soon as
+**Apply API key** is clicked, and reports "accepted" / "REJECTED (401/403), check
+provider-endpoint match" or a warning — before any upload happens. Backend config
+flow unchanged.
+
+**Addendum 2 (2026-10-15):** upload then failed on a **stale Gemini embedding
+model name** (`text-embedding-004` → 404 "not supported for embedContent").
+Mitigation: `embed_api()` now retries once on a model-level 404 using (a) a small
+set of current names and (b) Google's own suggested replacement parsed from the
+error body; the winner is cached in session state so the next call skips the dead
+name; non-model errors (401/429/network) never trickle through. Verified: offline
+checks cover the fallback + that auth/quota 401s are not retried. NB: the retired
+name involved (`text-embedding-004`) is confirmed retired via Google's current
+docs/community reports.
+
+**Addendum 3 (2026-10-15):** a **slow page-index call** (cloud embeds take seconds)
+ran inside the async `/upload` handler and blocked the event loop: every other
+endpoint stalled and the app's status/term-index polls timed out (real log:
+`ReadTimeout: ... HTTPConnectionPool(host='127.0.0.1', port=8000): Read timed out`).
+Mitigation: `index_page()` now runs in a worker thread; verified on a live uvicorn
+instance that `/llm/status` answers ~0.02s even mid-simulated-3s-upload. Also, on
+this machine the `ollama_reachable()` port probe used a flat timeout that turned
+into a long stall on Windows; it now uses a short connect timeout + 10s cache ---
+status replies 0.01s when cached. See commit `39ecc96`.
+
+**Addendum 4 (2026-10-15):** the **adapt/connect step** above surfaced **another
+stale model name**, this time the **chat model** `gemini-2.0-flash` → 404
+"no longer available, use models/gemini-3.8-flash". Mitigations:
+*llm_provider.py* `chat_api()` now mirrors the embeddings self-heal — after a
+model-level 404 it parses the provider's own suggested replacement and retries with
+known-current names (embedded once per session), filters out non-model errors; plus
+a circuit breaker open now requires a retryable failure (regex lookup in the error
+body to extract suggested endings) that can be fixed by `reset_circuit_breaker()`.
+Verified: the `/llm/config` endpoint now resets the breaker on re-apply; offline
+checks cover both chat and embed fallbacks and the breaker-reset-wiring.
 
 ## 4. Goal status (from FUTURE_GOALS.md)
 
@@ -173,10 +203,12 @@ or a warning — before any upload happens. Backend config flow unchanged.
 | 5 | Multilingual support | ⬜ Not started |
 | 6 | Explanation quality (source tracking, quality scoring, feedback loop) | ✅ **DONE (Session 2)** |
 | 7 | Document export & reporting | ⬜ Not started |
-| 8 | Auth & API keys | ⬜ Not started |
+| 8 | Auth & API keys | ⬜ **DONE (Session 5-6)**: cloud-api fallback with runtime config via Post /llm/config, key masking, session-fit, re-apply regenerates on later runs |
 | 9 | Testing suite | 🟨 Partial: standalone check script added; pytest suite still open |
 | 10 | Performance optimizations | ⬜ Not started |
 | 11 | Monitoring & observability | ⬜ Not started |
+
+
 | 12 | API versioning (`/api/v1`) | ⬜ Not started |
 
 ## 5. How to run / verify on the laptop (has Ollama)
