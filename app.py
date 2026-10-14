@@ -72,6 +72,29 @@ with st.sidebar:
                     if r.status_code == 200:
                         info = r.json()
                         st.success(f"Cloud API configured. Chat model: {info.get('chat_model')}")
+                        # Best-effort key sanity probe so a wrong key / wrong
+                        # endpoint pair is caught HERE, not during upload.
+                        try:
+                            probe = requests.get(
+                                f"{base_url.strip().rstrip('/')}/models",
+                                headers={"Authorization": f"Bearer {api_key.strip()}"},
+                                timeout=10,
+                            )
+                            if probe.status_code == 200:
+                                st.success("API key accepted by this endpoint.")
+                            elif probe.status_code in (401, 403):
+                                st.error(
+                                    "The API key was REJECTED by this endpoint (401/403). "
+                                    "The key probably belongs to a different provider, or is invalid. "
+                                    "Match the endpoint base URL above to the provider that issued the key."
+                                )
+                            else:
+                                st.warning(
+                                    f"Key probe returned HTTP {probe.status_code}. "
+                                    "Test with a small upload to be sure."
+                                )
+                        except requests.exceptions.RequestException:
+                            st.warning("Could not reach the endpoint to validate the key.")
                     else:
                         try:
                             detail = r.json().get("detail", r.text)

@@ -155,6 +155,13 @@ in response bodies, openapi contains new endpoints) exit 0 — then provider res
 **Still laptop-only:** an actual cloud call with a real key (billable) and Ollama
 side-by-side comparison.
 
+**Addendum (2026-10-15):** first real-world use surfaced the classic misconfiguration
+(a key from an unknown/unsupported provider pasted against the default OpenAI
+endpoint → upstream 401, surfaced as 503 at upload/indexing). Mitigation added:
+*app.py* now probes `{base_url}/models` with the key as soon as **Apply API key** is
+clicked, and reports "accepted" / "REJECTED (401/403), check provider-endpoint match"
+or a warning — before any upload happens. Backend config flow unchanged.
+
 ## 4. Goal status (from FUTURE_GOALS.md)
 
 | # | Goal | Status |
